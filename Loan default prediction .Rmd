@@ -1,0 +1,464 @@
+---
+title: "Loan deafault Prediction"
+author: "Jyothika Mohan"
+date: "2023-03-28"
+output: html_document
+---
+# Predicting Probability of Default 
+
+##(I HAVE TRIED 2 METHODS, ONE IS USING PCA AND OTHER USING CV FOR SELECTING BEST MODEL)
+
+#METHOD 1
+#Method of preprocessing the data and reducing dimensionality and building a model using Principal components of the features to predict loan default.
+
+##PROCESS OVERVIEW:
+
+##IN THIS METHOD WE FIRST BEGIN BY TAKING A LOOK AT THE TRAINING DATA SET AND THE DIFFERENT FEATURES OF THE LOAN DATA SET. WE CAN SEE THAT THERE IS A MIX OF BOTH NUMERICAL AND CATEGORICAL FEATURES – THUS WE SPILT THE NUMERICAL AND CATEGORICAL VARIABLE AND ONE HOT ENCODE THE CATEGORICAL FEATURES.
+
+##NEXT ONCE WE HAVE PRE PROCESSED THE DATA, WE CHECK IF ANY OF THE X FEATURES ARE CORRELATED IN THE DATA SET, WE FIND THAT “[1] "funded"               "amount"              
+#[3] "total_cc"             "pymnt_rec"           
+#[5] "out_prncp_inv"        "initial_list_statusa” ARE HIGHLY CORRELATED FEATURES
+#THIS CAN AFFECT BUILDING A MODEL, SO WE WANT TO HANDLE THE HIGHLY CORRELATED FEATURES BY USING PCA
+
+##NEXT WE CHECK IF BOTH CLASSES OF THE TARGET VARIABLE ARE BALNCED OR NOT. WE CAN SEE THAT THE DATA SET IS NOT BALANCED SO WE BALANCE THE CLASSES BY USING UPSAMPLING, IF THIS IS NOT DONE THEN THE MODEL WOULD NOT BE ABLE TO EFFECTIVELY PREDICT THE MINORITY CLASS AND MAY FAVOR THE MAJORITY CLASS
+
+#NEXT WE PERFORM PCA ON THE FEATURE SET AND ONLY SELECT THE FEATURES THAT CUMULATIVELY EXPLAIN 90% OF THE VARIATION.
+
+#HERE WE HAVE CHOSEN UPTO THE FIRST 35 PC’s THAT EXPLAIN A CUMULATIVE VARIANCE OF 90%
+
+##NEXT WE BUILD A LOGIT MODEL USING THE 35 PC’S AND NEXT USE THAT ON THE LOAN_TEST DATASET TO MAKE PREDICTIONS ON THE PROBABILITY OF DEFAULT
+
+##NOTE : WE PREPROCESS THE LOAN TEST DATA THE SAME WAY WE DID THE LOAN_TRAIN DATA SET (TRAINING DATA SET) THAT IS USED TO BUILD THE MODEL, SINCE THE TRAINED MODEL IS BUILT ON PRINCIPAL COMPONENTS THEN WE CHECK THE MAE TO CALCULATE THE MEAN ABSOLUTE ERROR OF THE PREDICTIONS OF DAFAULT MADE BY THE MODEL.
+
+
+```{r}
+#install.packages("magrittr") # package installations are only needed the first time you use it
+#install.packages("dplyr")    # alternative installation of the %>%
+library(magrittr) # needs to be run every time you start R and want to use %>%
+library(dplyr)    # alternatively, this also loads %>%
+library(caret)
+
+# read the loan.csv file
+loan <- read.csv("loan_train_final.csv")
+
+########## PREPROCESSING DATA ###############################3
+# Count the number of NA values for each column in the loan dataset
+colSums(is.na(loan))
+#We can see that the employment column have 134 NA values we can omit the values.
+
+loan <- na.omit(loan)
+
+# select the numeric and categorical features
+numeric_features <- loan %>% 
+  select(c(credit_ratio, interest, recover, coll_fee, out_prncp, total_cc, fees_rec, total_acc, amount,
+           monthly_payment, funded, v1, int_rec, last_payment, pymnt_rec, out_prncp_inv, violations,
+           del, inc, prin_rec, credit_bal, ncc, req, term))
+
+# strip "yrs" suffix from "term" feature and convert to numeric
+numeric_features$term <- as.numeric(gsub(" yrs", "", numeric_features$term))
+
+categorical_features <- loan %>% 
+  select( default, initial_list_status, employment, status, reason, quality)
+
+# perform one-hot encoding on categorical features
+encoded_categorical_features <- model.matrix(~.-1, data = categorical_features)
+
+# combine numeric and encoded categorical features
+features <- cbind(numeric_features, encoded_categorical_features)
+colnames(features)
+
+# perform correlation analysis
+cor_mat <- cor(features)
+highly_correlated <- findCorrelation(cor_mat, cutoff = 0.9, verbose = FALSE)
+highly_correlated_cols <- colnames(features)[highly_correlated]
+
+# print highly correlated columns
+print(highly_correlated_cols)
+
+table(features$default)
+
+# Upsample class 1 to match the frequency of class 0
+class_0_count <- sum(features$default == 0)
+class_1_count <- sum(features$default == 1)
+class_1_indices <- which(features$default == 1)
+upsampled_class_1_indices <- sample(class_1_indices, class_0_count - class_1_count, replace = TRUE)
+new_features <- rbind(features, features[upsampled_class_1_indices, ])
+table(features$default)
+
+features$default <- NULL
+# perform PCA on features matrix
+pca <- prcomp(features, center = TRUE, scale. = TRUE)
+
+##SELECTING PC'S THAT EXPLAIN UPTO 90% CUMULATIVE VARIANCE
+# calculate the proportion of variance explained by each principal component
+prop_var <- pca$sdev^2 / sum(pca$sdev^2)
+
+# calculate the cumulative proportion of variance explained
+cum_prop_var <- cumsum(prop_var)
+
+
+# find the number of principal components needed to explain 90% of the variance
+n_components <- min(which(cum_prop_var >= 0.9))
+
+# extract the selected principal components
+pc_features <- pca$x[,1:n_components]
+
+##ONCE THE PC's ARE SELECTED WE FIT A LOGIT MODEL
+# load necessary packages
+library(glmnet)
+library(pROC)
+
+# create a train and test set split on the data from loan_train.csv (i know we have a seperate test file, I have used a test train split here in this stage to first valdate the logit model I have built before introducing it to new data)
+set.seed(123)
+train_idx <- sample(nrow(pc_features), 0.7 * nrow(pc_features))
+train_pc <- pc_features[train_idx, ]
+test_pc <- pc_features[-train_idx, ]
+
+# create the target variable
+loan$default <- na.omit(loan$default)
+target <- loan$default[train_idx]
+target <- as.factor(target)
+
+# fit a logistic regression model
+fit <- cv.glmnet(train_pc, target, family = "binomial", type.measure = "auc")
+
+#This give the predicted probabilities on the test set I have created from the loan_test, i have done this to check the performance of the logot model 
+# predict on test set
+probabilities <- predict(fit, newx = test_pc, type = "response")
+
+# create ROC curve and calculate AUC
+roc <- roc(loan$default[-train_idx], probabilities)
+auc(roc)
+
+#########################################################################
+############################## LOAN TEST ################################
+#########################################################################
+
+#In this part we use the logit model fitted above to predict probabilities for the Loan_Test.csv
+
+# load necessary packages
+library(glmnet)
+library(pROC)
+
+# read the loan_test_final.csv file
+loan_test <- read.csv("loan_test_final.csv")
+
+#We should preprocess the test set just like we did for the train set and in order to fit the logit model that was built on PC of features 
+
+# Count the number of NA values for each column in the loan dataset
+colSums(is.na(loan_test))
+#We can see that the employment column have 134 NA values we can omit the values.
+
+loan_test <- na.omit(loan_test)
+
+# select the numeric and categorical features
+numeric_features_test <- loan_test %>%
+  select(c(credit_ratio, interest, recover, coll_fee, out_prncp, total_cc, fees_rec, total_acc, amount,
+           monthly_payment, funded, v1, int_rec, last_payment, pymnt_rec, out_prncp_inv, violations,
+           del, inc, prin_rec, credit_bal, ncc, req, term))
+
+# strip "yrs" suffix from "term" feature and convert to numeric
+numeric_features_test$term <- as.numeric(gsub(" yrs", "", numeric_features_test$term))
+dim(numeric_features_test)
+
+categorical_features_test <- loan_test %>%
+  select(initial_list_status, employment, status, reason, quality)
+dim(categorical_features_test)
+
+# ensure column names in categorical_features_test match those in categorical_features used for training
+colnames(categorical_features_test) <- intersect(colnames(categorical_features_test), colnames(categorical_features))
+
+# perform one-hot encoding on categorical features
+encoded_categorical_features_test <- model.matrix(~.-1, data = categorical_features_test)
+dim(encoded_categorical_features_test)
+
+
+# combine numeric and encoded categorical features
+features_test <- cbind(numeric_features_test, encoded_categorical_features_test)
+colnames(features_test)
+colnames(features)
+
+# transform features into principal components
+pc_features_test <- predict(pca, newdata = features_test)[, 1:n_components]
+
+######## risk score(probability of default) ON LOAN_TEST #######
+# predict on test set
+probabilities_test <- predict(fit, newx = pc_features_test, type = "response")
+
+# create ROC curve and calculate AUC
+roc_1 <- roc(loan_test$default, probabilities_test)
+auc(roc)
+
+
+#To calculate the Mean Absolute Error (MAE) of the loss on the test dataset
+features_test <- cbind(features_test, loan_test$default)
+n <- nrow(features_test)
+
+features_test_new <- cbind(features_test, probabilities_test)
+
+MAE <- sum(abs(features_test_new$`loan_test$default` - features_test_new$lambda.1se)*features_test_new$amount) / n
+cat("Mean Absolute Error:", MAE, "\n")
+
+```
+
+## BY USING PCA TO HANDLE HIGHLY CORRELATED FEATURES IN THE DATA SET WE LOSE INERPRETABILITY OF THE MODEL, AS ALL THE FEATURES HAVE BEEN TRANSFORMED AND THEIR LOADINGS ARE DIFFICULT TO INTERPRET 
+
+##HENCE ANOTHER APPROACH TO THE ABOVE PROBLEM BY USING CROSS VALIDATION FOR MODEL BUILDING AND FEATURE SELECTION - IN THIS APPROACH I CREATED A FOR LOOP TO CREATE MANY COMBINATIONS OF THE LOGIT MODEL AND USED CROSS VAIDATION TO CHOOSE THE MODEL WITH THE BEST PERFORMANCE - BEST ROC VALUE AMONG ALL OTHER MODELS - ONE THING TO NOTE HERE IS THAT WE CHOOSE THE MODEL WITH THE BEST MEAN ACCURACY (SINCE WE HAVE DIFFERENT ACCURACY FOR EVERY FOLD IN CROSS VALIDATION)
+
+##ONCE A MODEL IS CHOSEN, WE CAN VIEW THE FEATURES IN THE MODEL, IN OUR CASE IT HAS THE FOLLOWING FEATURES -> (NOTE THAT THIS LIST INCLUDE ONE HOT ENCODED FEATURES FOR CATEGORICAL VARIABLES)
+#[1] "credit_ratio"         "interest"            
+#[3] "recover"              "coll_fee"            
+#[5] "out_prncp"            "total_cc"            
+#[7] "fees_rec"             "total_acc"           
+#[9] "amount"               "monthly_payment"     
+#[11] "funded"               "v1"                  
+#[13] "int_rec"              "last_payment"        
+#[15] "out_prncp_inv"        "violations"          
+#[17] "del"                  "inc"                 
+#[19] "prin_rec"             "credit_bal"          
+#[21] "ncc"                  "req"                 
+#[23] "term"                 "initial_list_statusb"
+#[25] "employment1"          "employment10+"     
+#[27] "employment2"          "employment3"         
+#[29] "employment4"          "employment5"         
+#[31] "employment6"          "employment7"         
+#[33] "employment8"          "employment9"         
+#[35] "statuspartial"        "statusunchecked"     
+#[37] "reasonbusiness"       "reasoncc"            
+#[39] "reasondebt"           "reasonevent"         
+#[41] "reasonholiday"        "reasonhome"          
+#[43] "reasonmedical"        "reasonmoving"        
+#[45] "reasonother"          "reasonrenovation"    
+#[47] "reasonsolar"          "reasontransport"     
+#[49] "qualityq2"            "qualityq3"           
+#[51] "qualityq4"            "qualityq5"           
+#[53] "qualityq6"            "qualityq7" 
+
+```{r}
+
+#install.packages("magrittr") # package installations are only needed the first time you use it
+#install.packages("dplyr")    # alternative installation of the %>%
+library(magrittr) # needs to be run every time you start R and want to use %>%
+library(dplyr)    # alternatively, this also loads %>%
+library(caret)
+
+# read the loan.csv file
+loan <- read.csv("loan_train_final.csv")
+
+# Count the number of NA values for each column in the loan dataset
+colSums(is.na(loan))
+#We can see that the employment column have 134 NA values we can omit the values.
+
+loan <- na.omit(loan)
+
+#loan$default <- as.factor(loan$default)
+
+# select the numeric and categorical features
+numeric_features <- loan %>% 
+  select(c(credit_ratio, interest, recover, coll_fee, out_prncp, total_cc, fees_rec, total_acc, amount,
+           monthly_payment, funded, v1, int_rec, last_payment, pymnt_rec, out_prncp_inv, violations,
+           del, inc, prin_rec, credit_bal, ncc, req, term))
+
+# strip "yrs" suffix from "term" feature and convert to numeric
+numeric_features$term <- as.numeric(gsub(" yrs", "", numeric_features$term))
+
+categorical_features <- loan %>% 
+  select( default,initial_list_status, employment, status, reason, quality)
+
+# perform one-hot encoding on categorical features
+encoded_categorical_features <- model.matrix(~.-1, data = categorical_features)
+
+# combine numeric and encoded categorical features
+features <- cbind(numeric_features, encoded_categorical_features)
+
+# perform correlation analysis
+cor_mat <- cor(features)
+highly_correlated <- findCorrelation(cor_mat, cutoff = 0.9, verbose = FALSE)
+highly_correlated_cols <- colnames(features)[highly_correlated]
+
+# print highly correlated columns
+print(highly_correlated_cols)
+
+# Check the frequency counts of each class in the "default" variable
+table(features$default)
+
+# Upsample class 1 to match the frequency of class 0
+class_0_count <- sum(features$default == 0)
+class_1_count <- sum(features$default == 1)
+class_1_indices <- which(features$default == 1)
+upsampled_class_1_indices <- sample(class_1_indices, class_0_count - class_1_count, replace = TRUE)
+upsampled_features <- rbind(features, features[upsampled_class_1_indices, ])
+table(upsampled_features$default)
+
+# Split into 80% training set and 20% test set
+set.seed(123)
+train_index <- createDataPartition(upsampled_features$default, p = 0.8, list = FALSE)
+train <- upsampled_features[train_index,]
+test <- upsampled_features[-train_index,]
+#train <- upsampled_features
+
+library(caret)
+
+# define the six highly correlated features
+highly_correlated_cols <- c("funded", "amount", "total_cc", "pymnt_rec", "out_prncp_inv", "initial_list_statusa")
+
+# create a list of all possible combinations of the six highly correlated features
+feature_combinations <- lapply(1:length(highly_correlated_cols), function(x) {
+  combn(highly_correlated_cols, x, simplify = FALSE)
+})
+feature_combinations <- unlist(feature_combinations, recursive = FALSE)
+
+# create an empty list to store the logistic regression models
+models <- list()
+
+train$default <- as.factor(train$default)
+levels(train$default) <- c("no", "yes")
+
+# create a logistic regression model for each combination of highly correlated features
+for (i in 1:length(feature_combinations)) {
+  
+  # exclude the current combination of highly correlated features from the upsampled features
+  excluded_features <- unlist(feature_combinations[[i]])
+  included_features <- setdiff(colnames(train), excluded_features)
+  train_sub <- train[, included_features]
+  
+  # create the logistic regression model using cross-validation
+  model <- train(
+    default ~ .,
+    data = train_sub,
+    method = "glm",
+    family = "binomial",
+    trControl = trainControl(method = "cv", number = 5, classProbs = TRUE),
+    metric = "ROC"
+  )
+  
+  # add the model to the list
+  models[[i]] <- model
+  
+}
+
+# compare the performance of all models using cross-validation metrics
+results <- resamples(models)
+summary_results <- summary(results)
+a <- summary_results$statistics$Accuracy
+# Access the Mean column of the 'a' object
+mean_col <- a[,"Mean"]
+
+# Find the index of the model with the highest mean accuracy
+max_mean_idx <- which.max(mean_col)
+
+# Get the name of the model with the highest mean accuracy
+best_model_name <- names(mean_col[max_mean_idx])
+
+
+best_model <- models[[max_mean_idx]]
+best_model_coef_names <- models[[max_mean_idx]]$coefnames
+
+predicted_labels <- predict(models[[max_mean_idx]], newdata = test, type = "raw")
+
+y <- as.factor(test$default)
+levels(y) <- c("no", "yes")
+
+table(predicted_labels, y)
+
+f1_score <- function(y_true, y_pred, positive = "Yes") {
+  tp <- sum(y_true == "yes" & y_pred == "yes")
+  fp <- sum(y_true != "yes" & y_pred == "yes")
+  fn <- sum(y_true == "yes" & y_pred != "yes")
+  
+  precision <- tp / (tp + fp)
+  recall <- tp / (tp + fn)
+  
+  f1 <- 2 * precision * recall / (precision + recall)
+  
+  return(f1)
+}
+f1 <- f1_score( y, predicted_labels, positive = "Yes")
+cat("F1-score:", f1, "\n")
+
+
+```
+
+#THEN WE TEST THE BEST MODEL PICKED USING CROSS VALIDATION ON THE TEST DATASET AND EVALUE THE MAE LIKE BEFORE, BUT WE PREPROCESS THE TEST DATA SET AND SELECT THE SAME FATURES AS WE USED TO BUILD THE BEST MODEL THEN CHECK THE MAE
+
+
+```{r}
+#########################################################################
+########################## ON LOAN TEST DATASET #########################
+#########################################################################
+
+# read in the test data set
+loan_test <- read.csv("loan_test_final.csv")
+#colnames(loan_test)
+
+# Count the number of NA values for each column in the loan dataset
+colSums(is.na(loan_test))
+#We can see that the employment column have 134 NA values we can omit the values.
+
+loan_test <- na.omit(loan_test)
+
+#loan$default <- as.factor(loan$default)
+
+# select the numeric and categorical features
+numeric_features_test <- loan_test %>% 
+  select(c(credit_ratio, interest, recover, coll_fee, out_prncp, total_cc, fees_rec, total_acc, amount,
+           monthly_payment, funded, v1, int_rec, last_payment, pymnt_rec, out_prncp_inv, violations,
+           del, inc, prin_rec, credit_bal, ncc, req, term))
+
+# strip "yrs" suffix from "term" feature and convert to numeric
+numeric_features_test$term <- as.numeric(gsub(" yrs", "", numeric_features_test$term))
+
+categorical_features_test <- loan_test %>% 
+  select( default,initial_list_status, employment, status, reason, quality)
+
+# perform one-hot encoding on categorical features
+encoded_categorical_features_test <- model.matrix(~.-1, data = categorical_features_test)
+
+# combine numeric and encoded categorical features
+features_test <- cbind(numeric_features_test, encoded_categorical_features_test)
+
+
+# select the features used in the logistic regression model (model_16)
+features <- gsub("`employment10\\+`", "employment10+", best_model_coef_names)
+
+
+# create a new data frame with only the selected features from the test data
+test_sub <- features_test[, features]
+
+# use the model to predict the probabilities of default for the test data set
+predicted_prob_test <- predict(models[[max_mean_idx]], newdata = test_sub, type = "prob")
+
+#To evaluate the performance of the model on the test data set (New Data)
+predicted_labels_test <- predict(models[[max_mean_idx]], newdata = test_sub, type = "raw")
+
+y <- as.factor(features_test$default)
+levels(y) <- c("no", "yes")
+
+table(predicted_labels_test, y)
+
+f1_score <- function(y_true, y_pred, positive = "Yes") {
+  tp <- sum(y_true == "yes" & y_pred == "yes")
+  fp <- sum(y_true != "yes" & y_pred == "yes")
+  fn <- sum(y_true == "yes" & y_pred != "yes")
+  
+  precision <- tp / (tp + fp)
+  recall <- tp / (tp + fn)
+  
+  f1 <- 2 * precision * recall / (precision + recall)
+  
+  return(f1)
+}
+f1 <- f1_score( y, predicted_labels_test, positive = "Yes")
+cat("F1-score:", f1, "\n")
+
+#To calculate the Mean Absolute Error (MAE) of the loss on the test dataset
+n <- nrow(features_test)
+
+features_test_new <- cbind(features_test, predicted_prob_test[,"yes"])
+
+MAE <- sum(abs(features_test_new$default - features_test_new$predicted_prob_test)*features_test_new$amount) / n
+cat("Mean Absolute Error:", MAE, "\n")
+
+```
+
+##WE CAN SEE IN THE ABOVE 2 METHODS THAT THE MODEL BUILT USING FEATURE SECTION BY CROSS VALIDATION HAS LOWER MAE, BUT WHEN IT COMES TO HANDLING HIGHLY CORRELATED FEATURES IT IS ALWAYS USEFUL TO GO WITH TECHNIQUES LIKE PCA AS THEY TRANSFORM THE FEATURE SPACE, SO THAT THE PRINCIPAL COMPONENTS POINT TOWARDS THE DIRECTION OF MAXIMUM VARIATION.
